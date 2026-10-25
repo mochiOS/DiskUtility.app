@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-pub type Id = u32;
+pub type Id = u64;
 const GIB: u64 = 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -15,7 +15,7 @@ impl Kind {
             Self::Disk => "Disk",
             Self::Partition => "Partition",
             Self::Volume => "Volume",
-            Self::Unallocated => "Unallocated space",
+            Self::Unallocated => "Outside partitions",
         }
     }
 }
@@ -27,10 +27,13 @@ pub struct Node {
     pub kind: Kind,
     pub bytes: u64,
     pub used: Option<u64>,
-    pub format: Option<&'static str>,
-    pub mount: Option<&'static str>,
-    pub read_only: bool,
-    pub removable: bool,
+    pub format: Option<String>,
+    pub mount: Option<String>,
+    pub read_only: Option<bool>,
+    pub removable: Option<bool>,
+    pub start_sector: Option<u64>,
+    pub sector_bytes: Option<u32>,
+    pub capacity_from_partition_map: bool,
 }
 impl Node {
     pub fn free(&self) -> Option<u64> {
@@ -43,6 +46,9 @@ pub struct Model {
     pub expanded: BTreeSet<Id>,
     pub preview: bool,
     pub detail_open: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub partial: bool,
 }
 impl Model {
     pub fn new() -> Self {
@@ -56,7 +62,69 @@ impl Model {
             expanded: BTreeSet::new(),
             preview: false,
             detail_open: false,
+            loading: false,
+            error: None,
+            partial: false,
         }
+    }
+    pub fn apply_snapshot(&mut self, snapshot: appcore::storage::Snapshot) {
+        let was_empty = self.nodes.is_empty();
+        let old_selected = self.selected;
+        self.nodes = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| Node {
+                id: entry.id,
+                parent: entry.parent,
+                name: entry.name,
+                kind: match entry.kind {
+                    appcore::storage::Kind::Disk => Kind::Disk,
+                    appcore::storage::Kind::Partition => Kind::Partition,
+                    appcore::storage::Kind::Volume => Kind::Volume,
+                    appcore::storage::Kind::OutsidePartitions => Kind::Unallocated,
+                },
+                capacity_from_partition_map: entry.capacity_from_partition_map,
+                bytes: entry.capacity,
+                used: entry.used,
+                format: entry.format,
+                mount: entry.mount,
+                read_only: entry.read_only,
+                removable: None,
+                start_sector: matches!(
+                    entry.kind,
+                    appcore::storage::Kind::Partition | appcore::storage::Kind::OutsidePartitions
+                )
+                .then_some(entry.start_sector),
+                sector_bytes: (entry.sector_bytes != 0).then_some(entry.sector_bytes),
+            })
+            .collect();
+        self.selected = old_selected
+            .filter(|id| self.node(*id).is_some())
+            .or_else(|| self.nodes.iter().find(|n| n.parent.is_none()).map(|n| n.id));
+        let ids: BTreeSet<_> = self.nodes.iter().map(|n| n.id).collect();
+        self.expanded.retain(|id| ids.contains(id));
+        if was_empty {
+            self.expanded.extend(
+                self.nodes
+                    .iter()
+                    .filter(|n| n.parent.is_none())
+                    .map(|n| n.id),
+            );
+        }
+        self.detail_open &= old_selected.is_some() && old_selected == self.selected;
+        self.preview = false;
+        self.loading = false;
+        self.partial = snapshot.physical_inventory_unavailable;
+        self.error = (self.partial && self.nodes.is_empty())
+            .then(|| "Disk information is currently unavailable. Try Refresh again.".into());
+    }
+    pub fn load_failed(&mut self, error: appcore::Error) {
+        self.loading = false;
+        self.error = Some(match error {
+            appcore::Error::UnsupportedPlatform => "Live disk inspection is available on mochiOS. Enable sample disks to preview this interface on Linux.",
+            appcore::Error::System(13) => "Access to disk information was denied.",
+            _ => "Disk information could not be refreshed. Try Refresh again.",
+        }.into());
     }
     pub fn node(&self, id: Id) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
@@ -131,21 +199,32 @@ impl Model {
     #[cfg(any(target_os = "linux", test))]
     pub fn sample() -> Self {
         let mut nodes = vec![];
-        let mut add =
-            |id, parent, name: &str, kind, bytes, used, format, mount, read_only, removable| {
-                nodes.push(Node {
-                    id,
-                    parent,
-                    name: name.into(),
-                    kind,
-                    bytes,
-                    used,
-                    format,
-                    mount,
-                    read_only,
-                    removable,
-                });
-            };
+        let mut add = |id,
+                       parent,
+                       name: &str,
+                       kind,
+                       bytes,
+                       used,
+                       format: Option<&str>,
+                       mount: Option<&str>,
+                       read_only,
+                       removable| {
+            nodes.push(Node {
+                id,
+                parent,
+                name: name.into(),
+                kind,
+                bytes,
+                used,
+                format: format.map(str::to_owned),
+                mount: mount.map(str::to_owned),
+                read_only: Some(read_only),
+                removable: Some(removable),
+                start_sector: None,
+                sector_bytes: None,
+                capacity_from_partition_map: false,
+            });
+        };
         add(
             1,
             None,
@@ -259,6 +338,9 @@ impl Model {
             expanded: [1, 100].into_iter().collect(),
             preview: true,
             detail_open: false,
+            loading: false,
+            error: None,
+            partial: false,
         }
     }
     #[cfg(not(any(target_os = "linux", test)))]
@@ -318,5 +400,73 @@ mod tests {
         n.bytes = 0;
         n.used = Some(0);
         assert_eq!(n.free(), Some(0));
+    }
+    fn snapshot() -> appcore::storage::Snapshot {
+        appcore::storage::Snapshot {
+            physical_inventory_unavailable: false,
+            entries: Model::sample()
+                .nodes
+                .into_iter()
+                .map(|n| appcore::storage::Entry {
+                    id: n.id,
+                    parent: n.parent,
+                    name: n.name,
+                    capacity: n.bytes,
+                    used: n.used,
+                    read_only: n.read_only,
+                    format: n.format,
+                    mount: n.mount,
+                    start_sector: 0,
+                    sector_bytes: 0,
+                    capacity_from_partition_map: false,
+                    kind: match n.kind {
+                        Kind::Disk => appcore::storage::Kind::Disk,
+                        Kind::Partition => appcore::storage::Kind::Partition,
+                        Kind::Volume => appcore::storage::Kind::Volume,
+                        Kind::Unallocated => appcore::storage::Kind::OutsidePartitions,
+                    },
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn live_refresh_keeps_selection_and_failed_refresh_keeps_known_data() {
+        let mut m = Model::sample();
+        m.select(41);
+        m.loading = true;
+        let mut update = snapshot();
+        update.entries.reverse();
+        m.apply_snapshot(update);
+        assert!(!m.preview && !m.loading);
+        assert_eq!(m.selected, Some(41));
+        assert!(m.detail_open && m.expanded.contains(&40));
+        let count = m.nodes.len();
+        m.loading = true;
+        m.load_failed(appcore::Error::System(13));
+        assert_eq!(m.nodes.len(), count);
+        assert_eq!(m.selected, Some(41));
+        assert!(m.error.as_deref().unwrap().contains("denied"));
+        assert!(!m.loading);
+        let mut update = snapshot();
+        update.entries.retain(|n| n.id != 41);
+        m.apply_snapshot(update);
+        assert!(!m.detail_open);
+        assert_ne!(m.selected, Some(41));
+        assert!(m.error.is_none());
+    }
+    #[test]
+    fn partial_snapshots_do_not_invent_missing_device_attributes() {
+        let mut m = Model::sample();
+        let mut update = snapshot();
+        update.physical_inventory_unavailable = true;
+        update.entries.retain(|n| n.id == 41);
+        update.entries[0].parent = None;
+        update.entries[0].read_only = None;
+        m.apply_snapshot(update);
+        assert!(m.partial);
+        assert_eq!(m.selected, Some(41));
+        assert_eq!(m.nodes[0].read_only, None);
+        assert_eq!(m.nodes[0].removable, None);
+        assert_eq!(m.nodes[0].free(), Some(m.nodes[0].bytes - 128 * GIB));
     }
 }

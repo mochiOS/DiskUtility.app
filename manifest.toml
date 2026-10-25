@@ -20,4 +20,4 @@ resources = ["appicon.png"]
 [[binary]]
 path = "/system/applications/DiskUtility.app/entry.elf"
 kind = "application"
-requires = ["ipc.client", "ipc.server", "window.create"]
+requires = ["fs.read.all", "ipc.client", "ipc.server", "window.create"]

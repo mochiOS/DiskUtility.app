@@ -5,6 +5,8 @@ use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Action {
@@ -15,6 +17,7 @@ enum Action {
 }
 struct Core {
     model: RefCell<Model>,
+    receiver: RefCell<Option<Receiver<appcore::Result<appcore::storage::Snapshot>>>>,
     pending: Rc<Cell<Option<Action>>>,
     buttons: RefCell<BTreeMap<Action, ButtonInteractionState>>,
     tree_scroll: ScrollState,
@@ -33,6 +36,10 @@ impl Core {
         let Some(action) = self.pending.take() else {
             return false;
         };
+        if action == Action::Refresh && !self.model.borrow().preview {
+            self.start_refresh();
+            return true;
+        }
         let mut m = self.model.borrow_mut();
         match action {
             Action::Select(id) => {
@@ -45,6 +52,47 @@ impl Core {
             Action::Refresh => m.refresh(),
         }
         true
+    }
+    fn start_refresh(&self) {
+        if self.receiver.borrow().is_some() {
+            return;
+        }
+        self.model.borrow_mut().loading = true;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("disk-inventory".into())
+            .spawn(move || {
+                let _ = sender.send(appcore::storage::inventory());
+            }) {
+            Ok(_) => *self.receiver.borrow_mut() = Some(receiver),
+            Err(_) => self
+                .model
+                .borrow_mut()
+                .load_failed(appcore::Error::System(5)),
+        }
+    }
+    fn poll(&self) {
+        let result = self
+            .receiver
+            .borrow()
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match result {
+            Some(Ok(result)) => {
+                self.receiver.borrow_mut().take();
+                match result {
+                    Ok(snapshot) => self.model.borrow_mut().apply_snapshot(snapshot),
+                    Err(error) => self.model.borrow_mut().load_failed(error),
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.receiver.borrow_mut().take();
+                self.model
+                    .borrow_mut()
+                    .load_failed(appcore::Error::System(5));
+            }
+            _ => {}
+        }
     }
     fn tree(self: &Rc<Self>) -> Scroll {
         Scroll::new(self.tree_scroll.clone()).content(Tree(self.clone()))
@@ -111,12 +159,17 @@ fn fill(b: Rect, color: Color, c: &mut PaintContext<'_>) {
 }
 impl DiskView {
     pub fn new() -> Self {
-        Self::with_model(Model::new())
+        let view = Self::with_model(Model::new());
+        if !view.core.model.borrow().preview {
+            view.core.start_refresh();
+        }
+        view
     }
     fn with_model(model: Model) -> Self {
         Self {
             core: Rc::new(Core {
                 model: RefCell::new(model),
+                receiver: RefCell::new(None),
                 pending: Rc::new(Cell::new(None)),
                 buttons: RefCell::new(BTreeMap::new()),
                 tree_scroll: ScrollState::new(),
@@ -175,7 +228,7 @@ impl DiskView {
             self.core
                 .button("Refresh", Action::Refresh)
                 .leading_symbol(SymbolName::Refresh)
-                .enabled(self.core.model.borrow().preview),
+                .enabled(!self.core.model.borrow().loading),
         ));
         buttons
     }
@@ -185,7 +238,11 @@ impl View for DiskView {
         c.constrain(c.maximum)
     }
     fn paint(&self, b: Rect, c: &mut PaintContext<'_>) {
+        self.core.poll();
         let m = self.core.model.borrow();
+        if m.loading {
+            c.request_redraw_in_at(b, Instant::now() + Duration::from_millis(80));
+        }
         let f = Frames::new(b, m.detail_open);
         fill(b, c.theme.colors.background, c);
         fill(f.toolbar, c.theme.colors.surface_subtle, c);
@@ -211,18 +268,32 @@ impl View for DiskView {
                 b.size.width - 48.0,
                 72.0,
             );
-            Text::styled("Disk inspection is not connected", TextRole::TitleSmall).paint(title, c);
-            Text::body("This build does not yet connect Disk Utility to the storage service.")
-                .color(c.theme.colors.text_secondary)
-                .paint(
-                    rect(
-                        title.origin.x,
-                        title.origin.y + 88.0,
-                        title.size.width,
-                        96.0,
-                    ),
-                    c,
-                );
+            Text::styled(
+                if m.loading {
+                    "Loading disks…"
+                } else if m.error.is_some() {
+                    "Disk information unavailable"
+                } else {
+                    "No disks found"
+                },
+                TextRole::TitleSmall,
+            )
+            .paint(title, c);
+            Text::body(m.error.as_deref().unwrap_or(if m.loading {
+                "Reading disk and mounted-volume information."
+            } else {
+                "No storage devices or mounted volumes were reported."
+            }))
+            .color(c.theme.colors.text_secondary)
+            .paint(
+                rect(
+                    title.origin.x,
+                    title.origin.y + 88.0,
+                    title.size.width,
+                    96.0,
+                ),
+                c,
+            );
         } else {
             if let Some(tree) = f.tree {
                 fill(tree, c.theme.colors.surface_subtle, c);
@@ -235,8 +306,14 @@ impl View for DiskView {
         fill(f.footer, c.theme.colors.surface_subtle, c);
         Text::caption(if m.preview {
             "Preview · Sample disks. Disk changes are disabled."
+        } else if m.loading {
+            if m.nodes.is_empty() { "Reading disk information…" } else { "Refreshing… Displayed information may be out of date." }
+        } else if m.error.is_some() {
+            if m.nodes.is_empty() { m.error.as_deref().unwrap() } else { "Refresh failed. Displayed information is out of date; try Refresh again." }
+        } else if m.partial {
+            "Some disk details are unavailable. Available disk and mounted-volume information is shown."
         } else {
-            "Storage connection unavailable. No disk changes are made."
+            "Read-only disk inspection."
         })
         .color(c.theme.colors.text_secondary)
         .paint(
@@ -437,10 +514,22 @@ impl Detail {
                 .child(Divider::new())
                 .child(info(
                     "Connection",
-                    if n.removable { "Removable" } else { "Internal" },
+                    match n.removable {
+                        Some(true) => "Removable",
+                        Some(false) => "Internal",
+                        None => "Unknown",
+                    },
                     theme,
                 ))
-                .child(info("Partition map", "GPT (sample)", theme));
+                .child(info(
+                    "Partition map",
+                    if m.preview {
+                        "GPT (sample)"
+                    } else {
+                        n.format.as_deref().unwrap_or("Unknown")
+                    },
+                    theme,
+                ));
         }
         if n.kind == Kind::Volume {
             stack = stack.child(Text::label("Storage usage"));
@@ -458,14 +547,43 @@ impl Detail {
             }
             stack = stack
                 .child(Divider::new())
-                .child(info("File system", n.format.unwrap_or("Unknown"), theme))
-                .child(info("Mount point", n.mount.unwrap_or("Not mounted"), theme));
+                .child(info(
+                    "File system",
+                    n.format.as_deref().unwrap_or("Unknown"),
+                    theme,
+                ))
+                .child(info(
+                    "Mount point",
+                    n.mount.as_deref().unwrap_or("Not mounted"),
+                    theme,
+                ));
         }
         if n.kind == Kind::Unallocated {
-            stack = stack.child(Text::body("This space is outside the disk's partitions."));
+            stack = stack.child(Text::body("This space is outside the disk's partitions. It may include partition-table metadata."));
         }
         if n.kind == Kind::Partition {
-            stack = stack.child(Text::label("Volumes"));
+            let volume = m.children(n.id).find(|node| node.kind == Kind::Volume);
+            stack = stack
+                .child(info(
+                    "File system",
+                    volume
+                        .and_then(|node| node.format.as_deref())
+                        .unwrap_or("Unknown"),
+                    theme,
+                ))
+                .child(info(
+                    "Mount point",
+                    volume
+                        .and_then(|node| node.mount.as_deref())
+                        .unwrap_or(if m.preview { "Not mounted" } else { "Unknown" }),
+                    theme,
+                ))
+                .child(Text::label("Volumes"));
+            if volume.is_none() {
+                stack = stack.child(Text::body(
+                    "Mount and file system information is unavailable.",
+                ));
+            }
             for volume in m.children(n.id) {
                 stack = stack.child(
                     self.0
@@ -475,24 +593,58 @@ impl Detail {
                 );
             }
         }
-        stack = stack.child(info("Capacity", model::bytes(n.bytes), theme));
+        stack = stack.child(info(
+            if n.capacity_from_partition_map {
+                "GPT capacity"
+            } else {
+                "Capacity"
+            },
+            model::bytes(n.bytes),
+            theme,
+        ));
+        if n.capacity_from_partition_map {
+            stack = stack.child(
+                Text::caption(
+                    "Capacity reported by the partition table; hardware capacity is unavailable.",
+                )
+                .color(theme.colors.text_secondary),
+            );
+        }
         if n.kind != Kind::Unallocated {
             stack = stack.child(info(
                 "Access",
-                if n.read_only {
-                    "Read-only"
-                } else {
-                    "Read/write (sample)"
+                match n.read_only {
+                    Some(true) => "Read-only",
+                    Some(false) => {
+                        if m.preview {
+                            "Read/write (sample)"
+                        } else {
+                            "Read/write"
+                        }
+                    }
+                    None => "Unknown",
                 },
                 theme,
             ));
         }
+        if let Some(start) = n.start_sector {
+            stack = stack.child(info("First sector", start.to_string(), theme));
+        }
+        if let Some(sector_bytes) = n.sector_bytes {
+            stack = stack.child(info("Sector size", format!("{sector_bytes} bytes"), theme));
+        }
         if let Some(disk) = m.disk_for(n.id).filter(|d| d.id != n.id) {
             stack = stack.child(info("Disk", &disk.name, theme));
         }
-        stack = stack.child(Divider::new()).child(Text::label("Disk management"))
-            .child(Text::caption("Mounting, erasing and partition editing will be available after storage management is connected.")
-                .color(theme.colors.text_secondary));
+        stack = stack
+            .child(Divider::new())
+            .child(Text::label("Disk management"))
+            .child(
+                Text::caption(
+                    "Mounting, erasing and partition editing are not available in this version.",
+                )
+                .color(theme.colors.text_secondary),
+            );
         Padding::all(theme.spacing.large).content(stack)
     }
 }
@@ -525,7 +677,7 @@ impl View for PartitionMap {
             let width = b.size.width * (part.bytes as f64 / disk.bytes as f64) as f32;
             let color = if part.kind == Kind::Unallocated {
                 c.theme.colors.surface_subtle
-            } else if part.read_only {
+            } else if part.read_only == Some(true) {
                 c.theme.colors.text_secondary
             } else {
                 c.theme.colors.accent

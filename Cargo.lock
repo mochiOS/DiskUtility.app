@@ -1020,6 +1020,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "mochi-user-platform",
+ "mochios-filesystem-protocol",
  "mochios-keychain-protocol",
  "mochios-posix-client",
  "mochios-posix-protocol",

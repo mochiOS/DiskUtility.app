@@ -1,56 +1,59 @@
 # Disk Utility
 
-Initial native AppCore / ViewKit interface for disk, partition and volume inspection.
-Default window: 960 × 640. Labels use English and the existing omochi theme,
-shared button padding and VK Symbols. No disk access or changes are performed.
+Native AppCore / ViewKit disk, partition and mounted-volume inspection. The existing
+960 × 640 layout, omochi controls, VK Symbols and application icon are preserved.
+Inspection is read-only; Mount/Unmount, Partition and Erase remain disabled.
 
-## Preview
+## mochiOS
 
-`mmake preview-disk-utility` opens the app directly. `mmake ui` includes it in the
-application catalogue. Linux uses disposable, explicitly labelled sample disks;
-it never enumerates, opens, mounts or modifies host disks. Set
-`MOCHIOS_PREVIEW_DISK_UTILITY_DEMO=0` to inspect the unconnected state instead.
-Native mochiOS always opens the unconnected state; it never displays the fixtures
-as real device information. Refresh reloads fixtures while keeping selection and
-disclosure state; it is disabled for the unconnected backend.
+The app obtains `appcore::storage::inventory()` on a worker thread. It requests
+`fs.read.all` to open a read-only namespace-root Handle through POSIX, and queries
+filesystem.service through that retained Handle. It never receives raw disk or
+write authority. The provider rejects ordinary IPC, non-root objects, CONTROL,
+attached Handles and malformed requests. No new kernel API is added.
 
-The sidebar is a disk → partition → volume tree, with unallocated disk space as a
-separate entry. Selecting an entry opens its details. Disk partition bars are
-proportional to partition sizes; the list below provides selectable names and
-sizes even when a partition is too small to target in the bar. Volume usage is
-separate from disk unallocated space. Missing/invalid usage stays unknown rather
-than being reported as zero. At widths below 700px, the list and details become
-separate views with a Disks back button. These dimensions are app layout choices,
-not new global design tokens.
+The service reports mDriver disk capacity, GPT identities and partition extents,
+plus live ext4 accounting for its actual Data and System mounts. Physical
+inspection is bounded to 16 devices and 128 partitions per device. If the active
+legacy disk session prevents mDriver inspection, the service reads validated GPT
+metadata only on disks it already mounted. Those disk capacities are explicitly
+labelled **GPT capacity**; they are not presented as hardware inquiry results.
+GPT CRCs, ranges, overlap and identities are validated. Disk-space gaps are named
+**Outside partitions** because they can include partition-table metadata and are
+not a claim of usable, writable space.
 
-The wide toolbar reserves Mount/Unmount, Partition and Erase controls; they are
-disabled and labelled as unconnected. Mount, unmount, erase, partition editing
-and rename are not implemented or exposed as working actions. The manifest requests only IPC and window creation; there is
-no raw storage capability. The application icon is the existing `docs/resources/appicons/Disk Utility.app.png`,
-copied unchanged to `appicon.png`. Partition/eject VK Symbols are pending; controls
-use existing VK Symbols and text labels. No placeholder disk-management icons were invented.
+Mounted volumes are linked to partitions only by the owner's exact device/range
+mapping. Missing or ambiguous mappings leave mounted volumes as independent
+entries. Unmounted filesystems are not opened or guessed from partition type.
+Unknown access, connection type and filesystem remain unknown. Read-only state
+and usage come from the mounted filesystem owner; filesystem capacity is distinct
+from partition capacity. Mount metadata is registered by the owner during its
+current startup mounting flow; dynamic mount operations are not implemented.
 
-## Connecting actual storage
+Provider snapshots are cached for two seconds and pages carry a generation.
+AppCore rejects mixed generations, duplicate identities and invalid parent trees,
+and retries interrupted pagination within a bound. Refresh preserves selection
+and disclosure by identity. Errors retain prior data with a stale-data message;
+partial physical discovery retains available disk and mounted-volume information.
+A failed/empty query never becomes a sample or a zero-capacity disk.
 
-Existing `mochi_user_platform::storage::control` provides LIST_DEVICE / INSPECT
-and partition-control selectors. Their response contracts, access rights and
-current mDriver support need verification before connecting them. Existing
-filesystem volume status / POSIX statvfs provides volume accounting, including
-read-only state; it does not enumerate all devices or implement mount/unmount.
-The filesystem protocol's legacy OP_MOUNT returns root metadata and must not be
-misrepresented as dynamic mounting.
+## Linux preview
 
-The next stage is an authenticated userspace inventory adapter that keeps device,
-partition and mounted-volume identities distinct and queries capacity from the
-actual filesystem owner. Inventory work must leave the UI thread, retain known
-selection by identity, and report stale/denied/unavailable states explicitly.
-Management operations require a separate capability-checked path, protected
-system-volume rules and operation-specific confirmation. The UI process should
-not gain unrestricted raw write access merely to display inventory.
+`mmake preview-disk-utility` opens the app; `mmake ui` includes it in the catalogue.
+Linux continues to use explicitly labelled sample disks and never enumerates,
+opens, mounts or modifies host disks. Set `MOCHIOS_PREVIEW_DISK_UTILITY_DEMO=0` to
+check the unsupported-connection/error state. Preview and live results use the
+same tree/detail components. Below 700px, list and details remain separate views
+with a Disks back button.
 
 ## Verification
 
-Model tests cover partition accounting, unknown usage and stable selection through
-refresh/disclosure. UI tests cover compact/wide pane bounds and native rendering
-for every entry kind. Visual verification is performed by the user. Host and
-mochiOS builds use the existing preview workspace and native SDK respectively.
+Tests cover the wire bounds and encoding, physical ranges and malformed tables,
+root-Handle authorization and query-only dispatch using a disposable ext4 image,
+real volume accounting, pagination generations, AppCore tree validation, stable
+selection, stale data, missing attributes and existing compact/wide UI behavior.
+Build verification covers Linux and the native filesystem.service / application.
+Visual and on-device verification are performed by the user.
+
+The icon remains the unchanged `docs/resources/appicons/Disk Utility.app.png` copy.
+Partition/eject VK Symbols are still pending; existing symbols and text are used.
