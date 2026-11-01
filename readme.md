@@ -1,8 +1,17 @@
 # Disk Utility
 
-Native AppCore / ViewKit disk, partition and mounted-volume inspection. The existing
-960 × 640 layout, omochi controls, VK Symbols and application icon are preserved.
-Inspection is read-only; Mount/Unmount, Partition and Erase remain disabled.
+Native AppCore / ViewKit disk, partition and mounted-volume inspection. The
+960 × 640 initial window, omochi controls, VK Symbols and application icon are
+preserved. Inspection is read-only; Mount/Unmount, Partition and Erase remain
+disabled.
+
+The interface uses `Toolbar` / `ActionToolbar` for measured actions and native
+overflow, `NavigationSplitView` and `SidebarItem` for disk navigation, and
+`ContentArea::pane`, `List` / `ListRow` and compact `SettingsRow` values for the
+inspector. Pane backgrounds, continuous corners, clipping and pointer routing
+belong to ViewKit. The partition-capacity diagram remains application drawing;
+it uses the same validated capacity data as the textual entries. Usage progress
+is shown only when actual usage is available.
 
 ## mochiOS
 
@@ -45,6 +54,9 @@ opens, mounts or modifies host disks. Set `MOCHIOS_PREVIEW_DISK_UTILITY_DEMO=0` 
 check the unsupported-connection/error state. Preview and live results use the
 same tree/detail components. Below 700px, list and details remain separate views
 with a Disks back button.
+Refresh remains available at narrow widths; unavailable storage actions can
+overflow into the standard action menu. The preview/sample notice remains
+visible in a measured footer instead of a fixed rectangle.
 
 ## Verification
 
@@ -52,6 +64,8 @@ Tests cover the wire bounds and encoding, physical ranges and malformed tables,
 root-Handle authorization and query-only dispatch using a disposable ext4 image,
 real volume accounting, pagination generations, AppCore tree validation, stable
 selection, stale data, missing attributes and existing compact/wide UI behavior.
+UI tests also cover light/dark pane corners, toolbar bounds, native navigation
+across reconstructed views and disabled storage-mutation actions after refresh.
 Build verification covers Linux and the native filesystem.service / application.
 Visual and on-device verification are performed by the user.
 

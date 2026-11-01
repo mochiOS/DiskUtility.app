@@ -11,26 +11,39 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Action {
     Select(Id),
+    Show(Id),
     Toggle(Id),
     Refresh,
     Back,
+    Mount,
+    Partition,
+    Erase,
 }
 struct Core {
     model: RefCell<Model>,
     receiver: RefCell<Option<Receiver<appcore::Result<appcore::storage::Snapshot>>>>,
     pending: Rc<Cell<Option<Action>>>,
     buttons: RefCell<BTreeMap<Action, ButtonInteractionState>>,
+    toolbar: ActionToolbarState<Action>,
     tree_scroll: ScrollState,
     detail_scroll: ScrollState,
 }
 impl Core {
+    fn interaction(&self, action: Action) -> ButtonInteractionState {
+        self.buttons.borrow_mut().entry(action).or_default().clone()
+    }
     fn button(&self, label: &str, action: Action) -> Button {
-        let interaction = self.buttons.borrow_mut().entry(action).or_default().clone();
+        let interaction = self.interaction(action);
         let pending = self.pending.clone();
         Button::with_interaction_and_label(interaction, label)
             .size(ButtonSize::Small)
             .style(ButtonStyle::Ghost)
             .on_click(move || pending.set(Some(action)))
+    }
+    fn row(&self, label: &str, id: Id) -> ListRow {
+        let pending = self.pending.clone();
+        ListRow::with_interaction(self.interaction(Action::Show(id)), label)
+            .on_select(move || pending.set(Some(Action::Show(id))))
     }
     fn apply(&self) -> bool {
         let Some(action) = self.pending.take() else {
@@ -42,7 +55,7 @@ impl Core {
         }
         let mut m = self.model.borrow_mut();
         match action {
-            Action::Select(id) => {
+            Action::Select(id) | Action::Show(id) => {
                 if m.select(id) {
                     self.detail_scroll.reset();
                 }
@@ -50,6 +63,7 @@ impl Core {
             Action::Toggle(id) => m.toggle(id),
             Action::Back => m.detail_open = false,
             Action::Refresh => m.refresh(),
+            Action::Mount | Action::Partition | Action::Erase => {}
         }
         true
     }
@@ -105,52 +119,9 @@ impl Core {
 pub struct DiskView {
     core: Rc<Core>,
 }
-#[derive(Clone, Copy)]
-struct Frames {
-    toolbar: Rect,
-    tree: Option<Rect>,
-    detail: Option<Rect>,
-    footer: Rect,
-}
+const COMPACT_WIDTH: f32 = 700.0;
 fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect::new(x, y, w.max(0.0), h.max(0.0))
-}
-impl Frames {
-    fn new(b: Rect, detail_open: bool) -> Self {
-        let top = b.size.height.min(48.0);
-        let footer_height = (b.size.height - top).clamp(0.0, 40.0);
-        let body = rect(
-            b.origin.x,
-            b.origin.y + top,
-            b.size.width,
-            b.size.height - top - footer_height,
-        );
-        let compact = b.size.width < 700.0;
-        let (tree, detail) = if compact {
-            ((!detail_open).then_some(body), detail_open.then_some(body))
-        } else {
-            (
-                Some(rect(body.origin.x, body.origin.y, 232.0, body.size.height)),
-                Some(rect(
-                    body.origin.x + 232.0,
-                    body.origin.y,
-                    body.size.width - 232.0,
-                    body.size.height,
-                )),
-            )
-        };
-        Self {
-            toolbar: rect(b.origin.x, b.origin.y, b.size.width, top),
-            tree,
-            detail,
-            footer: rect(
-                b.origin.x,
-                body.origin.y + body.size.height,
-                b.size.width,
-                footer_height,
-            ),
-        }
-    }
 }
 fn fill(b: Rect, color: Color, c: &mut PaintContext<'_>) {
     Rectangle::new()
@@ -172,65 +143,128 @@ impl DiskView {
                 receiver: RefCell::new(None),
                 pending: Rc::new(Cell::new(None)),
                 buttons: RefCell::new(BTreeMap::new()),
+                toolbar: ActionToolbarState::new(),
                 tree_scroll: ScrollState::new(),
                 detail_scroll: ScrollState::new(),
             }),
         }
     }
-    fn toolbar(&self, b: Rect, compact_detail: bool) -> Vec<(Rect, Button)> {
-        let mut buttons = vec![];
+    fn toolbar(&self, compact_detail: bool) -> Toolbar<ActionToolbar<Action>> {
+        let m = self.core.model.borrow();
+        let mut actions =
+            ActionToolbar::new(self.core.toolbar.clone()).context_key(m.selected.unwrap_or(0));
+        if !compact_detail {
+            actions = actions.title("Disk Utility");
+        }
         if compact_detail {
-            buttons.push((
-                rect(b.origin.x + 12.0, b.origin.y + 9.0, 96.0, 30.0),
+            actions = actions.leading(
+                Action::Back,
                 self.core
                     .button("Disks", Action::Back)
                     .leading_symbol(SymbolName::ChevronLeft),
-            ));
+            );
         }
-        if b.size.width >= 700.0 {
-            let m = self.core.model.borrow();
-            let mounted = m
-                .selected
-                .and_then(|id| m.node(id))
-                .is_some_and(|n| n.mount.is_some());
-            for (i, label) in [
-                if mounted { "Unmount" } else { "Mount" },
-                "Partition",
-                "Erase",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                buttons.push((
-                    rect(
-                        b.origin.x + b.size.width - 368.0 + i as f32 * 84.0,
-                        b.origin.y + 9.0,
-                        80.0,
-                        30.0,
-                    ),
-                    Button::new(label)
-                        .size(ButtonSize::Small)
-                        .style(ButtonStyle::Ghost)
-                        .enabled(false)
-                        .accessibility_label(format!(
-                            "{label}. Storage management is not connected"
-                        )),
-                ));
-            }
-        }
-        buttons.push((
-            rect(
-                b.origin.x + b.size.width - 104.0,
-                b.origin.y + 9.0,
-                92.0,
-                30.0,
-            ),
+        actions = actions.trailing(
+            Action::Refresh,
             self.core
                 .button("Refresh", Action::Refresh)
                 .leading_symbol(SymbolName::Refresh)
-                .enabled(!self.core.model.borrow().loading),
-        ));
-        buttons
+                .enabled(!m.loading),
+        );
+        // These actions remain unavailable until the storage owner supports them.
+        let mounted = m
+            .selected
+            .and_then(|id| m.node(id))
+            .is_some_and(|n| n.mount.is_some());
+        for (action, label) in [
+            (Action::Mount, if mounted { "Unmount" } else { "Mount" }),
+            (Action::Partition, "Partition"),
+            (Action::Erase, "Erase"),
+        ] {
+            actions = actions.trailing(action, self.core.button(label, action).enabled(false));
+        }
+        Toolbar::new(actions)
+    }
+
+    fn content(&self, width: f32, theme: &Theme) -> VStack {
+        let m = self.core.model.borrow();
+        let compact_detail = width < COMPACT_WIDTH && m.detail_open;
+        let body: Box<dyn View> = if m.nodes.is_empty() {
+            Box::new(
+                Surface::pane().content(ContentArea::pane(
+                    VStack::new()
+                        .alignment(StackAlignment::Stretch)
+                        .gap(StackGap::Medium)
+                        .child(Text::styled(
+                            if m.loading {
+                                "Loading disks…"
+                            } else if m.error.is_some() {
+                                "Disk information unavailable"
+                            } else {
+                                "No disks found"
+                            },
+                            TextRole::TitleSmall,
+                        ))
+                        .child(
+                            Text::body(m.error.as_deref().unwrap_or(if m.loading {
+                                "Reading disk and mounted-volume information."
+                            } else {
+                                "No storage devices or mounted volumes were reported."
+                            }))
+                            .color(theme.colors.text_secondary),
+                        ),
+                )),
+            )
+        } else if width >= COMPACT_WIDTH {
+            Box::new(
+                NavigationSplitView::new(self.core.tree(), self.core.detail())
+                    .flexible_sidebar(200.0, theme.layout.navigation_sidebar_width, 280.0)
+                    .minimum_detail_width(420.0)
+                    .shows_divider(false),
+            )
+        } else if compact_detail {
+            Box::new(Surface::pane().content(self.core.detail()))
+        } else {
+            Box::new(
+                Surface::sidebar().content(
+                    Padding::symmetric(theme.spacing.medium, theme.spacing.large)
+                        .content(self.core.tree()),
+                ),
+            )
+        };
+        let status = if m.preview {
+            "Preview · Sample disks. Disk changes are disabled."
+        } else if m.loading {
+            if m.nodes.is_empty() {
+                "Reading disk information…"
+            } else {
+                "Refreshing… Displayed information may be out of date."
+            }
+        } else if m.error.is_some() {
+            if m.nodes.is_empty() {
+                m.error.as_deref().unwrap()
+            } else {
+                "Refresh failed. Displayed information is out of date; try Refresh again."
+            }
+        } else if m.partial {
+            "Some disk details are unavailable. Available disk and mounted-volume information is shown."
+        } else {
+            "Read-only disk inspection."
+        };
+        VStack::new()
+            .alignment(StackAlignment::Stretch)
+            .gap(StackGap::None)
+            .child(self.toolbar(compact_detail))
+            .child(body.layout().flex_grow(1.0).flex_shrink(1.0))
+            .child(
+                Surface::sidebar()
+                    .content(
+                        Padding::symmetric(theme.spacing.extra_large, theme.spacing.small)
+                            .content(Text::caption(status).color(theme.colors.text_secondary)),
+                    )
+                    .layout()
+                    .flex_shrink(0.0),
+            )
     }
 }
 impl View for DiskView {
@@ -239,98 +273,16 @@ impl View for DiskView {
     }
     fn paint(&self, b: Rect, c: &mut PaintContext<'_>) {
         self.core.poll();
-        let m = self.core.model.borrow();
-        if m.loading {
+        if self.core.model.borrow().loading {
             c.request_redraw_in_at(b, Instant::now() + Duration::from_millis(80));
         }
-        let f = Frames::new(b, m.detail_open);
-        fill(b, c.theme.colors.background, c);
-        fill(f.toolbar, c.theme.colors.surface_subtle, c);
-        let compact_detail = b.size.width < 700.0 && m.detail_open;
-        if !compact_detail {
-            Text::label("Disk Utility").paint(
-                rect(
-                    b.origin.x + 16.0,
-                    b.origin.y + 12.0,
-                    b.size.width - 132.0,
-                    24.0,
-                ),
-                c,
-            );
-        }
-        for (bounds, button) in self.toolbar(f.toolbar, compact_detail) {
-            button.paint(bounds, c);
-        }
-        if m.nodes.is_empty() {
-            let title = rect(
-                b.origin.x + 24.0,
-                b.origin.y + 112.0,
-                b.size.width - 48.0,
-                72.0,
-            );
-            Text::styled(
-                if m.loading {
-                    "Loading disks…"
-                } else if m.error.is_some() {
-                    "Disk information unavailable"
-                } else {
-                    "No disks found"
-                },
-                TextRole::TitleSmall,
-            )
-            .paint(title, c);
-            Text::body(m.error.as_deref().unwrap_or(if m.loading {
-                "Reading disk and mounted-volume information."
-            } else {
-                "No storage devices or mounted volumes were reported."
-            }))
-            .color(c.theme.colors.text_secondary)
-            .paint(
-                rect(
-                    title.origin.x,
-                    title.origin.y + 88.0,
-                    title.size.width,
-                    96.0,
-                ),
-                c,
-            );
-        } else {
-            if let Some(tree) = f.tree {
-                fill(tree, c.theme.colors.surface_subtle, c);
-                self.core.tree().paint(tree, c);
-            }
-            if let Some(detail) = f.detail {
-                self.core.detail().paint(detail, c);
-            }
-        }
-        fill(f.footer, c.theme.colors.surface_subtle, c);
-        Text::caption(if m.preview {
-            "Preview · Sample disks. Disk changes are disabled."
-        } else if m.loading {
-            if m.nodes.is_empty() { "Reading disk information…" } else { "Refreshing… Displayed information may be out of date." }
-        } else if m.error.is_some() {
-            if m.nodes.is_empty() { m.error.as_deref().unwrap() } else { "Refresh failed. Displayed information is out of date; try Refresh again." }
-        } else if m.partial {
-            "Some disk details are unavailable. Available disk and mounted-volume information is shown."
-        } else {
-            "Read-only disk inspection."
-        })
-        .color(c.theme.colors.text_secondary)
-        .paint(
-            rect(
-                f.footer.origin.x + 12.0,
-                f.footer.origin.y + 4.0,
-                f.footer.size.width - 24.0,
-                f.footer.size.height - 8.0,
-            ),
-            c,
-        );
+        Surface::app()
+            .content(self.content(b.size.width, c.theme))
+            .paint(b, c);
     }
     fn handle_event(&self, b: Rect, e: &ViewEvent, c: &mut EventContext<'_>) -> EventResult {
-        let detail_open = self.core.model.borrow().detail_open;
-        let f = Frames::new(b, detail_open);
-        if b.size.width < 700.0
-            && detail_open
+        if b.size.width < COMPACT_WIDTH
+            && self.core.model.borrow().detail_open
             && matches!(
                 e,
                 ViewEvent::KeyPressed {
@@ -341,25 +293,18 @@ impl View for DiskView {
         {
             self.core.pending.set(Some(Action::Back));
         }
-        let mut result = EventResult::Ignored;
-        for (bounds, button) in self.toolbar(f.toolbar, b.size.width < 700.0 && detail_open) {
-            result = result.merge(button.handle_event(bounds, e, c));
-        }
-        if !self.core.model.borrow().nodes.is_empty() {
-            if let Some(tree) = f.tree {
-                result = result.merge(self.core.tree().handle_event(tree, e, c));
-            }
-            if let Some(detail) = f.detail {
-                result = result.merge(self.core.detail().handle_event(detail, e, c));
-            }
-        }
+        let result = Surface::app()
+            .content(self.content(b.size.width, c.theme()))
+            .handle_event(b, e, c);
         if self.core.apply() {
             c.request_redraw_in(b);
-            return EventResult::Consumed;
+            EventResult::Consumed
+        } else {
+            result
         }
-        result
     }
 }
+
 struct Tree(Rc<Core>);
 impl Tree {
     fn content(&self, theme: &Theme) -> VStack {
@@ -373,6 +318,7 @@ impl Tree {
             let mut row = HStack::new()
                 .alignment(StackAlignment::Center)
                 .gap(StackGap::None);
+            let disclosure_width = theme.controls.small_height;
             if children {
                 row = row.child(
                     self.0
@@ -391,60 +337,38 @@ impl Tree {
                             },
                             n.name
                         ))
-                        .frame(28.0, 28.0),
+                        .frame(disclosure_width, disclosure_width),
                 );
             } else {
                 row = row.child(
                     Spacer::new()
                         .into_stack_child()
-                        .width(28.0)
-                        .height(28.0)
+                        .width(disclosure_width)
                         .flex_grow(0.0),
                 );
             }
-            let selection = self
-                .0
-                .button(&n.name, Action::Select(id))
-                .accessibility_label(format!(
-                    "{}, {}, {}",
-                    n.name,
-                    n.kind.label(),
-                    model::bytes(n.bytes)
-                ))
-                .accessibility_role(AccessibilityRole::ListItem)
-                .accessibility_selected(m.selected == Some(id))
-                .style(ButtonStyle::Custom {
-                    background: if m.selected == Some(id) {
-                        theme.list.selected_background
-                    } else {
-                        Color::TRANSPARENT
-                    },
-                    hovered_background: theme.list.hovered_background,
-                    border: Color::TRANSPARENT,
-                    hovered_border: Color::TRANSPARENT,
-                    foreground: theme.list.foreground,
-                })
-                .alignment(ZStackAlignment::Leading);
-            let selection = match n.kind {
-                Kind::Disk => selection.leading_symbol(SymbolName::Internaldrive),
-                Kind::Volume => selection.leading_symbol(SymbolName::Folder),
+            let pending = self.0.pending.clone();
+            let mut selection =
+                SidebarItem::with_interaction(self.0.interaction(Action::Select(id)), &n.name)
+                    .reserve_symbol_space()
+                    .selected(m.selected == Some(id))
+                    .on_select(move || pending.set(Some(Action::Select(id))));
+            selection = match n.kind {
+                Kind::Disk => selection.symbol(SymbolName::Internaldrive),
+                Kind::Volume => selection.symbol(SymbolName::Folder),
                 _ => selection,
             };
             row = row.child(selection.layout().flex_grow(1.0));
             stack = stack.child(
                 Padding::only(
-                    if depth == 0 {
-                        theme.spacing.medium
-                    } else {
-                        0.0
-                    },
-                    theme.spacing.small,
+                    if depth == 0 { theme.spacing.small } else { 0.0 },
                     0.0,
-                    theme.spacing.small + depth as f32 * theme.spacing.medium,
+                    0.0,
+                    depth as f32 * theme.spacing.medium,
                 )
                 .content(row)
                 .layout()
-                .height(if depth == 0 { 44.0 } else { 32.0 }),
+                .flex_shrink(0.0),
             );
         }
         stack
@@ -462,28 +386,17 @@ impl View for Tree {
     }
 }
 struct Detail(Rc<Core>);
-fn info(label: &str, value: impl Into<String>, theme: &Theme) -> HStack {
-    HStack::new()
-        .alignment(StackAlignment::Center)
-        .gap(StackGap::Medium)
-        .child(
-            Text::caption(label)
-                .color(theme.colors.text_secondary)
-                .layout()
-                .width(120.0)
-                .flex_shrink(0.0),
-        )
-        .child(Text::body(value.into()).layout().flex_grow(1.0))
+fn info(label: &str, value: impl Into<String>) -> SettingsRow {
+    settings_value(label, "", value).compact()
 }
 impl Detail {
-    fn content(&self, theme: &Theme) -> Padding<VStack> {
+    fn content(&self, theme: &Theme) -> ContentArea<VStack> {
         let m = self.0.model.borrow();
         let mut stack = VStack::new()
             .alignment(StackAlignment::Stretch)
             .gap(StackGap::Medium);
         let Some(n) = m.selected.and_then(|id| m.node(id)) else {
-            return Padding::all(theme.spacing.large)
-                .content(stack.child(Text::label("Select a disk or volume")));
+            return ContentArea::pane(stack.child(Text::label("Select a disk or volume")));
         };
         stack = stack
             .child(Text::styled(&n.name, TextRole::TitleMedium))
@@ -500,16 +413,18 @@ impl Detail {
                 .layout()
                 .height(48.0),
             );
+            let mut partitions = List::new();
             for part in m.children(n.id) {
-                stack = stack.child(
+                partitions = partitions.row(
                     self.0
-                        .button(
-                            &format!("{}   ·   {}", part.name, model::bytes(part.bytes)),
-                            Action::Select(part.id),
-                        )
-                        .alignment(ZStackAlignment::Leading),
+                        .row(&part.name, part.id)
+                        .trailing(model::bytes(part.bytes))
+                        .layout()
+                        .height(theme.layout.settings_row_height)
+                        .flex_shrink(0.0),
                 );
             }
+            stack = stack.child(partitions);
             stack = stack
                 .child(Divider::new())
                 .child(info(
@@ -519,7 +434,6 @@ impl Detail {
                         Some(false) => "Internal",
                         None => "Unknown",
                     },
-                    theme,
                 ))
                 .child(info(
                     "Partition map",
@@ -528,20 +442,22 @@ impl Detail {
                     } else {
                         n.format.as_deref().unwrap_or("Unknown")
                     },
-                    theme,
                 ));
         }
         if n.kind == Kind::Volume {
             stack = stack.child(Text::label("Storage usage"));
             if let (Some(used), Some(free)) = (n.used, n.free()) {
                 stack = stack
-                    .child(ProgressBar::new(if n.bytes == 0 {
-                        0.0
-                    } else {
-                        used as f32 / n.bytes as f32
-                    }))
-                    .child(info("Used", model::bytes(used), theme))
-                    .child(info("Available", model::bytes(free), theme));
+                    .child(
+                        ProgressBar::new(if n.bytes == 0 {
+                            0.0
+                        } else {
+                            used as f32 / n.bytes as f32
+                        })
+                        .accessibility_label("Storage usage"),
+                    )
+                    .child(info("Used", model::bytes(used)))
+                    .child(info("Available", model::bytes(free)));
             } else {
                 stack = stack.child(Text::body("Usage unavailable"));
             }
@@ -550,12 +466,10 @@ impl Detail {
                 .child(info(
                     "File system",
                     n.format.as_deref().unwrap_or("Unknown"),
-                    theme,
                 ))
                 .child(info(
                     "Mount point",
                     n.mount.as_deref().unwrap_or("Not mounted"),
-                    theme,
                 ));
         }
         if n.kind == Kind::Unallocated {
@@ -569,14 +483,12 @@ impl Detail {
                     volume
                         .and_then(|node| node.format.as_deref())
                         .unwrap_or("Unknown"),
-                    theme,
                 ))
                 .child(info(
                     "Mount point",
                     volume
                         .and_then(|node| node.mount.as_deref())
                         .unwrap_or(if m.preview { "Not mounted" } else { "Unknown" }),
-                    theme,
                 ))
                 .child(Text::label("Volumes"));
             if volume.is_none() {
@@ -584,14 +496,18 @@ impl Detail {
                     "Mount and file system information is unavailable.",
                 ));
             }
+            let mut volumes = List::new();
             for volume in m.children(n.id) {
-                stack = stack.child(
+                volumes = volumes.row(
                     self.0
-                        .button(&volume.name, Action::Select(volume.id))
-                        .leading_symbol(SymbolName::Folder)
-                        .alignment(ZStackAlignment::Leading),
+                        .row(&volume.name, volume.id)
+                        .icon(SymbolName::Folder)
+                        .layout()
+                        .height(theme.layout.settings_row_height)
+                        .flex_shrink(0.0),
                 );
             }
+            stack = stack.child(volumes);
         }
         stack = stack.child(info(
             if n.capacity_from_partition_map {
@@ -600,7 +516,6 @@ impl Detail {
                 "Capacity"
             },
             model::bytes(n.bytes),
-            theme,
         ));
         if n.capacity_from_partition_map {
             stack = stack.child(
@@ -624,17 +539,16 @@ impl Detail {
                     }
                     None => "Unknown",
                 },
-                theme,
             ));
         }
         if let Some(start) = n.start_sector {
-            stack = stack.child(info("First sector", start.to_string(), theme));
+            stack = stack.child(info("First sector", start.to_string()));
         }
         if let Some(sector_bytes) = n.sector_bytes {
-            stack = stack.child(info("Sector size", format!("{sector_bytes} bytes"), theme));
+            stack = stack.child(info("Sector size", format!("{sector_bytes} bytes")));
         }
         if let Some(disk) = m.disk_for(n.id).filter(|d| d.id != n.id) {
-            stack = stack.child(info("Disk", &disk.name, theme));
+            stack = stack.child(info("Disk", &disk.name));
         }
         stack = stack
             .child(Divider::new())
@@ -645,7 +559,7 @@ impl Detail {
                 )
                 .color(theme.colors.text_secondary),
             );
-        Padding::all(theme.spacing.large).content(stack)
+        ContentArea::pane(stack)
     }
 }
 impl View for Detail {
@@ -699,19 +613,68 @@ mod tests {
     use super::*;
     use appcore::viewkit::draw_command::DisplayList;
     use appcore::viewkit::typography::TextMeasurer;
+    fn paint(
+        view: &DiskView,
+        width: f32,
+        theme: &Theme,
+    ) -> (
+        DisplayList,
+        Vec<appcore::viewkit::accessibility::AccessibilityNode>,
+    ) {
+        let mut list = DisplayList::new();
+        let mut nodes = Vec::new();
+        let mut text = TextMeasurer::new();
+        let bounds = rect(0.0, 0.0, width, 640.0);
+        view.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, theme, &theme.typography, &mut text)
+                .with_viewport_bounds(bounds)
+                .with_accessibility_nodes(&mut nodes),
+        );
+        (list, nodes)
+    }
     #[test]
-    fn compact_and_wide_frames_never_overlap_the_toolbar_or_footer() {
-        for width in [320.0, 699.0, 700.0, 960.0, 1600.0] {
-            for open in [false, true] {
-                let b = rect(24.0, 12.0, width, 480.0);
-                let f = Frames::new(b, open);
-                for body in [f.tree, f.detail].into_iter().flatten() {
-                    assert!(body.origin.y >= f.toolbar.origin.y + f.toolbar.size.height);
-                    assert!(body.origin.y + body.size.height <= f.footer.origin.y);
-                    assert!(body.origin.x + body.size.width <= b.origin.x + width);
+    fn native_toolbar_and_panes_stay_reachable_in_both_layouts_and_themes() {
+        use appcore::viewkit::draw_command::DrawCommand;
+        let view = DiskView::with_model(Model::sample());
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            for width in [320.0, 699.0, 700.0, 960.0, 1600.0] {
+                for open in [false, true] {
+                    view.core.model.borrow_mut().detail_open = open;
+                    let (list, nodes) = paint(&view, width, &theme);
+                    let toolbar = nodes
+                        .iter()
+                        .find(|n| n.role == AccessibilityRole::Toolbar)
+                        .unwrap()
+                        .bounds;
+                    assert_eq!(toolbar.origin.y, 0.0);
+                    assert!(
+                        nodes
+                            .iter()
+                            .any(|n| n.label.as_deref() == Some("Refresh") && n.enabled)
+                    );
+                    assert_eq!(
+                        nodes.iter().any(|n| n.label.as_deref() == Some("Disks")),
+                        width < COMPACT_WIDTH && open
+                    );
+                    for node in nodes.iter().filter(|n| n.role == AccessibilityRole::Button) {
+                        assert!(node.bounds.origin.x >= 0.0);
+                        assert!(node.bounds.origin.x + node.bounds.size.width <= width + 0.01);
+                        if node.bounds.origin.y < toolbar.size.height {
+                            assert!(
+                                node.bounds.origin.y + node.bounds.size.height
+                                    <= toolbar.size.height
+                            );
+                        }
+                    }
+                    if width >= COMPACT_WIDTH {
+                        assert!(list.commands().iter().any(|cmd| matches!(cmd,
+                            DrawCommand::PushRoundedCornersClip { rect, radii }
+                                if rect.origin.x > 0.0 && rect.origin.y == toolbar.size.height
+                                    && radii[0] == theme.radius.extra_large
+                        )));
+                    }
                 }
-                assert_eq!(f.tree.is_some(), width >= 700.0 || !open);
-                assert_eq!(f.detail.is_some(), width >= 700.0 || open);
             }
         }
     }
@@ -722,15 +685,25 @@ mod tests {
         view.core.model.borrow_mut().select(41);
         let b = rect(0.0, 0.0, 360.0, 480.0);
         let theme = Theme::LIGHT;
+        let (_, nodes) = paint(&view, 360.0, &theme);
+        let back = nodes
+            .iter()
+            .find(|n| n.label.as_deref() == Some("Disks"))
+            .unwrap()
+            .bounds;
+        let position = Point::new(
+            back.origin.x + back.size.width / 2.0,
+            back.origin.y + back.size.height / 2.0,
+        );
         let mut measurer = TextMeasurer::new();
         let mut c = EventContext::new(&theme, &theme.typography, &mut measurer);
         for e in [
             ViewEvent::PointerPressed {
-                position: Point::new(40.0, 24.0),
+                position,
                 button: PointerButton::Primary,
             },
             ViewEvent::PointerReleased {
-                position: Point::new(40.0, 24.0),
+                position,
                 button: PointerButton::Primary,
             },
         ] {
@@ -779,6 +752,76 @@ mod tests {
                     &mut PaintContext::new(&mut list, &theme, &theme.typography, &mut measurer),
                 );
                 assert!(!list.commands().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn native_sidebar_selection_survives_reconstruction_between_press_and_release() {
+        use appcore::viewkit::platform::PointerButton;
+        let view = DiskView::with_model(Model::sample());
+        let theme = Theme::LIGHT;
+        view.core.model.borrow_mut().toggle(40);
+        let name = view.core.model.borrow().node(41).unwrap().name.clone();
+        let (_, nodes) = paint(&view, 960.0, &theme);
+        let row = nodes
+            .iter()
+            .filter(|n| {
+                n.label.as_deref() == Some(name.as_str()) && n.role == AccessibilityRole::Button
+            })
+            .max_by(|a, b| a.bounds.origin.x.total_cmp(&b.bounds.origin.x))
+            .unwrap()
+            .bounds;
+        let position = Point::new(
+            row.origin.x + row.size.width / 2.0,
+            row.origin.y + row.size.height / 2.0,
+        );
+        let mut text = TextMeasurer::new();
+        let mut context = EventContext::new(&theme, &theme.typography, &mut text);
+        for event in [
+            ViewEvent::PointerPressed {
+                position,
+                button: PointerButton::Primary,
+            },
+            ViewEvent::PointerReleased {
+                position,
+                button: PointerButton::Primary,
+            },
+        ] {
+            view.clone()
+                .handle_event(rect(0.0, 0.0, 960.0, 640.0), &event, &mut context);
+        }
+        assert_eq!(view.core.model.borrow().selected, Some(41));
+        let (_, nodes) = paint(&view, 960.0, &theme);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.label.as_deref() == Some("Storage usage")
+                    && n.role == AccessibilityRole::ProgressIndicator)
+        );
+    }
+
+    #[test]
+    fn storage_mutations_remain_disabled_and_refresh_does_not_reenable_them() {
+        let view = DiskView::with_model(Model::sample());
+        for selected in [1, 41] {
+            view.core.model.borrow_mut().select(selected);
+            for refresh in [false, true] {
+                if refresh {
+                    view.core.pending.set(Some(Action::Refresh));
+                    view.core.apply();
+                }
+                let (_, nodes) = paint(&view, 960.0, &Theme::LIGHT);
+                let mutations: Vec<_> = nodes
+                    .iter()
+                    .filter(|n| {
+                        n.label.as_deref().is_some_and(|label| {
+                            matches!(label, "Mount" | "Unmount" | "Partition" | "Erase")
+                        })
+                    })
+                    .collect();
+                assert_eq!(mutations.len(), 3);
+                assert!(mutations.iter().all(|n| !n.enabled));
             }
         }
     }
